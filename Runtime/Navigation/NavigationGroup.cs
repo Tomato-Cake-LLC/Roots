@@ -3,7 +3,6 @@
 using System;
 using System.Collections.Generic;
 using RishUI;
-using Roots;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -148,7 +147,7 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         return cur;
     }
 
-    // Returns the index of the child at sibling position i (0-based).
+    // Returns the node index of the child at sibling position i (0-based).
     private int ChildAt(int groupIdx, int i) {
         int cur = _nodes[groupIdx].firstChild;
         for (int j = 0; j < i && cur >= 0; j++) {
@@ -371,12 +370,46 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // --- Navigation tree ---
 
+    // Scratch lists for tree building. Static because BuildTree is iterative — only one
+    // Setup frame runs at a time, so these lists are never accessed re-entrantly.
+    //
+    // s_elemsBuffer: flat storage for all frame element slices. Grows as child frames
+    //                copy their elements into it; cleared at the start of each rebuild.
+    // s_stack:       explicit work stack replacing the call stack.
+    // s_childResults: result slots (node indices) shared across all frames in one rebuild.
+    //                 Slots are allocated incrementally; written by Setup, read by Await.
+    // s_pairs:        per-Setup-frame temp for (containerChildIndex, elemIdx) grouping.
+    // s_runs:         per-Setup-frame temp for multi-element child runs before stack push.
+    private static readonly List<(NavItem item, VisualElement ve)> s_elemsBuffer = new();
+    private static readonly List<BuildFrame> s_stack = new();
+    private static readonly List<int> s_childResults = new();
+    private static readonly List<(int key, int elemIdx)> s_pairs = new();
+    private static readonly List<(VisualElement container, int elemsStart, int elemsCount, int resultSlot)> s_runs = new();
+
+    private struct BuildFrame {
+        // When false: compute the NavNode for (container, elements slice).
+        // When true:  collect child results and build the group node.
+        public bool isAwait;
+
+        // Setup fields
+        public VisualElement? container;
+        public int elemsStart, elemsCount;
+
+        // Index in s_childResults where this frame writes its result.
+        // -1 means this is the root frame; result goes to BuildTree's return value.
+        public int resultSlot;
+
+        // Await fields (unused in Setup frames)
+        public Direction axis;
+        public int childResultsStart, childCount;
+    }
+
     private void RebuildGraph() {
         _navRootIndex = -1;
         _nodes.Clear();
         _leafLookup.Clear();
+        s_elemsBuffer.Clear();
 
-        using var interactable = ListPool<(NavItem item, VisualElement ve)>.Take();
         foreach (var item in items) {
             if (!item.interactable) {
                 continue;
@@ -386,12 +419,12 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             if (bounds.width == 0f && bounds.height == 0f) {
                 return;
             }
-            interactable.Add((item, item.bridge.Element));
+            s_elemsBuffer.Add((item, item.bridge.Element));
         }
 
         var rootVe = GetVisualChild();
-        if (rootVe != null && interactable.Count >= 1) {
-            _navRootIndex = BuildTree(rootVe, interactable.list);
+        if (rootVe != null && s_elemsBuffer.Count >= 1) {
+            _navRootIndex = BuildTree(rootVe);
         }
 
         // Linear scan is simpler and cheaper than recursive traversal.
@@ -404,117 +437,222 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         graphDirty = false;
     }
 
-    // Recursively maps the interactable elements onto the UIToolkit flex tree, bottom-up.
-    // Returns the index of the resulting node in _nodes, or -1 if no node was produced.
-    // Single-child transparent wrappers are collapsed. Multi-child containers become group nodes
-    // whose axis matches the container's flex direction.
-    private int BuildTree(VisualElement container, List<(NavItem item, VisualElement ve)> elements) {
-        if (elements.Count == 0) {
-            return -1;
-        }
-        if (elements.Count == 1) {
-            return MakeLeaf(elements[0].item);
-        }
+    // Iteratively maps the interactable elements (in s_elemsBuffer[0..]) onto the UIToolkit
+    // flex tree using an explicit work stack, avoiding call-stack overflow on deep UI trees.
+    //
+    // Setup frames group their elements by the direct container child that contains each one,
+    // then push an Await frame (which will build the group node) followed by child Setup frames
+    // in reverse order (so child 0 runs first off the stack).
+    // Await frames run after all their children and wire up the sibling chain + group node.
+    private int BuildTree(VisualElement rootContainer) {
+        s_stack.Clear();
+        s_childResults.Clear();
 
-        // Group elements by the direct child of container that contains each one.
-        // Flat list of (containerChildIndex, elemIdx) pairs, sorted by key, then processed
-        // as contiguous runs — avoids SortedList<int, List<...>> allocations.
-        using var pairs = ListPool<(int key, int elemIdx)>.Take();
-        for (int i = 0; i < elements.Count; i++) {
-            var ancestor = FindDirectChildOf(container, elements[i].ve);
-            if (ancestor == null) {
-                continue;
-            }
-            int idx = container.IndexOf(ancestor);
-            if (idx < 0) {
-                continue;
-            }
-            pairs.Add((idx, i));
-        }
+        s_stack.Add(new BuildFrame {
+            container = rootContainer,
+            elemsStart = 0,
+            elemsCount = s_elemsBuffer.Count,
+            resultSlot = -1,
+        });
 
-        if (pairs.Count == 0) {
-            return -1;
-        }
+        int rootResult = -1;
 
-        pairs.list.Sort((a, b) => a.key.CompareTo(b.key));
+        while (s_stack.Count > 0) {
+            var frame = s_stack[^1];
+            s_stack.RemoveAt(s_stack.Count - 1);
 
-        // Count distinct container-child keys to detect transparent wrappers.
-        int distinctKeys = 1;
-        for (int i = 1; i < pairs.Count; i++) {
-            if (pairs[i].key != pairs[i - 1].key) {
-                distinctKeys++;
-            }
-        }
-
-        // Transparent wrapper: all elements fall under a single child — descend into it.
-        if (distinctKeys == 1) {
-            return BuildTree(container.ElementAt(pairs[0].key), elements);
-        }
-
-        // Build one child node per contiguous run of the same container-child key.
-        // Link them as a sibling chain: firstChild → nextSibling → ... → -1.
-        using var childNodeIndices = ListPool<int>.Take();
-        int runStart = 0;
-        while (runStart < pairs.Count) {
-            int runKey = pairs[runStart].key;
-            int runEnd = runStart + 1;
-            while (runEnd < pairs.Count && pairs[runEnd].key == runKey) {
-                runEnd++;
-            }
-
-            int childIdx;
-            if (runEnd - runStart == 1) {
-                childIdx = MakeLeaf(elements[pairs[runStart].elemIdx].item);
+            if (frame.isAwait) {
+                ProcessAwaitFrame(frame, ref rootResult);
             } else {
-                using var subElems = ListPool<(NavItem item, VisualElement ve)>.Take();
-                for (int i = runStart; i < runEnd; i++) {
-                    subElems.Add(elements[pairs[i].elemIdx]);
+                ProcessSetupFrame(frame, ref rootResult);
+            }
+        }
+
+        return rootResult;
+    }
+
+    private void ProcessAwaitFrame(BuildFrame frame, ref int rootResult) {
+        // Count children that produced a valid node (some runs may return -1 if empty).
+        int validCount = 0;
+        for (int i = 0; i < frame.childCount; i++) {
+            if (s_childResults[frame.childResultsStart + i] >= 0) {
+                validCount++;
+            }
+        }
+
+        if (validCount == 0) {
+            WriteResult(frame.resultSlot, -1, ref rootResult);
+            return;
+        }
+
+        // If only one valid child survived, pass it through without wrapping in a group.
+        if (validCount == 1) {
+            for (int i = 0; i < frame.childCount; i++) {
+                int r = s_childResults[frame.childResultsStart + i];
+                if (r >= 0) {
+                    WriteResult(frame.resultSlot, r, ref rootResult);
+                    return;
                 }
-                childIdx = BuildTree(container.ElementAt(runKey), subElems.list);
             }
-
-            if (childIdx >= 0) {
-                childNodeIndices.Add(childIdx);
-            }
-            runStart = runEnd;
         }
 
-        if (childNodeIndices.Count == 0) {
-            return -1;
-        }
-        if (childNodeIndices.Count == 1) {
-            return childNodeIndices[0];
-        }
-
-        // groupIdx is known before Add() since it will be appended at the current end.
+        // Build a group node and wire up the sibling chain.
         int groupIdx = _nodes.Count;
-
-        // Wire up sibling chain and set parent/childIndex on each child.
-        for (int i = 0; i < childNodeIndices.Count; i++) {
-            int childIdx = childNodeIndices[i];
-            var child = _nodes[childIdx];
-            child.parentIndex = groupIdx;
-            child.childIndex = i;
-            child.nextSibling = i + 1 < childNodeIndices.Count ? childNodeIndices[i + 1] : -1;
-            _nodes[childIdx] = child;
-        }
-
         _nodes.Add(new NavNode {
-            axis = GetFlexAxis(container),
-            firstChild = childNodeIndices[0],
+            axis = frame.axis,
+            firstChild = -1,
             defaultChildIndex = 0,
             parentIndex = -1,
             childIndex = 0,
             nextSibling = -1,
         });
 
+        int prevChildIdx = -1;
+        int firstChildIdx = -1;
+        int childPos = 0;
+        for (int i = 0; i < frame.childCount; i++) {
+            int childNodeIdx = s_childResults[frame.childResultsStart + i];
+            if (childNodeIdx < 0) {
+                continue;
+            }
+            if (firstChildIdx < 0) {
+                firstChildIdx = childNodeIdx;
+            }
+            var child = _nodes[childNodeIdx];
+            child.parentIndex = groupIdx;
+            child.childIndex = childPos++;
+            _nodes[childNodeIdx] = child;
+
+            if (prevChildIdx >= 0) {
+                var prev = _nodes[prevChildIdx];
+                prev.nextSibling = childNodeIdx;
+                _nodes[prevChildIdx] = prev;
+            }
+            prevChildIdx = childNodeIdx;
+        }
+
+        var groupNode = _nodes[groupIdx];
+        groupNode.firstChild = firstChildIdx;
         // Find which child subtree contains the isDefault element, so perpendicular entry
         // lands on the correct element (e.g. entering a row of options lands on the active one).
-        var groupNode = _nodes[groupIdx];
         groupNode.defaultChildIndex = FindDefaultChildIndex(groupIdx);
         _nodes[groupIdx] = groupNode;
 
-        return groupIdx;
+        WriteResult(frame.resultSlot, groupIdx, ref rootResult);
+    }
+
+    private void ProcessSetupFrame(BuildFrame frame, ref int rootResult) {
+        if (frame.elemsCount == 0) {
+            WriteResult(frame.resultSlot, -1, ref rootResult);
+            return;
+        }
+        if (frame.elemsCount == 1) {
+            WriteResult(frame.resultSlot, MakeLeaf(s_elemsBuffer[frame.elemsStart].item), ref rootResult);
+            return;
+        }
+
+        // Group elements by the direct child of container that contains each one.
+        s_pairs.Clear();
+        for (int i = 0; i < frame.elemsCount; i++) {
+            var ve = s_elemsBuffer[frame.elemsStart + i].ve;
+            var ancestor = FindDirectChildOf(frame.container!, ve);
+            if (ancestor == null) {
+                continue;
+            }
+            int idx = frame.container!.IndexOf(ancestor);
+            if (idx < 0) {
+                continue;
+            }
+            s_pairs.Add((idx, frame.elemsStart + i));
+        }
+
+        if (s_pairs.Count == 0) {
+            WriteResult(frame.resultSlot, -1, ref rootResult);
+            return;
+        }
+
+        s_pairs.Sort((a, b) => a.key.CompareTo(b.key));
+
+        // Count distinct container-child keys to detect transparent wrappers.
+        int distinctKeys = 1;
+        for (int i = 1; i < s_pairs.Count; i++) {
+            if (s_pairs[i].key != s_pairs[i - 1].key) {
+                distinctKeys++;
+            }
+        }
+
+        // Transparent wrapper: all elements fall under a single child — reuse element slice,
+        // push a new Setup frame for the child container (equivalent to a tail call).
+        if (distinctKeys == 1) {
+            s_stack.Add(new BuildFrame {
+                container = frame.container!.ElementAt(s_pairs[0].key),
+                elemsStart = frame.elemsStart,
+                elemsCount = frame.elemsCount,
+                resultSlot = frame.resultSlot,
+            });
+            return;
+        }
+
+        // Process each contiguous run of the same container-child key.
+        // Single-element runs become leaf nodes immediately. Multi-element runs are deferred
+        // as child Setup frames. Collect them in s_runs so we can push in reverse order.
+        s_runs.Clear();
+        int childResultsStart = s_childResults.Count;
+        int runNum = 0;
+        int runStart = 0;
+        while (runStart < s_pairs.Count) {
+            int runKey = s_pairs[runStart].key;
+            int runEnd = runStart + 1;
+            while (runEnd < s_pairs.Count && s_pairs[runEnd].key == runKey) {
+                runEnd++;
+            }
+
+            // Reserve a result slot for this run.
+            s_childResults.Add(-1);
+
+            if (runEnd - runStart == 1) {
+                // Single element: make the leaf now, write directly to the slot.
+                s_childResults[childResultsStart + runNum] = MakeLeaf(s_elemsBuffer[s_pairs[runStart].elemIdx].item);
+            } else {
+                // Multi-element: copy this run's elements to the buffer tail for the child frame.
+                int childElemsStart = s_elemsBuffer.Count;
+                for (int i = runStart; i < runEnd; i++) {
+                    s_elemsBuffer.Add(s_elemsBuffer[s_pairs[i].elemIdx]);
+                }
+                s_runs.Add((frame.container!.ElementAt(runKey), childElemsStart, runEnd - runStart, childResultsStart + runNum));
+            }
+
+            runStart = runEnd;
+            runNum++;
+        }
+
+        // Push Await frame first — it runs after all children complete.
+        s_stack.Add(new BuildFrame {
+            isAwait = true,
+            axis = GetFlexAxis(frame.container!),
+            childResultsStart = childResultsStart,
+            childCount = runNum,
+            resultSlot = frame.resultSlot,
+        });
+
+        // Push child Setup frames in reverse order so child 0 is on top and runs first.
+        for (int i = s_runs.Count - 1; i >= 0; i--) {
+            var (container, elemsStart, elemsCount, resultSlot) = s_runs[i];
+            s_stack.Add(new BuildFrame {
+                container = container,
+                elemsStart = elemsStart,
+                elemsCount = elemsCount,
+                resultSlot = resultSlot,
+            });
+        }
+    }
+
+    private static void WriteResult(int resultSlot, int nodeIdx, ref int rootResult) {
+        if (resultSlot < 0) {
+            rootResult = nodeIdx;
+        } else {
+            s_childResults[resultSlot] = nodeIdx;
+        }
     }
 
     private int MakeLeaf(NavItem item) {
