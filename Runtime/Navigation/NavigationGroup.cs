@@ -37,8 +37,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // Navigation walks UP the tree to find the nearest ancestor group on the pressed axis, steps
     // to the next sibling, then resolves the entry point by descending into the target subtree.
     //
-    // All nodes live in NavigationGroup._nodes (flat arena). Children are referenced via index
-    // ranges into NavigationGroup._childIndices to avoid per-group array allocations.
+    // All nodes live in NavigationGroup._nodes (flat arena). Children and siblings are linked
+    // by index — no heap allocations per node or per rebuild.
     public struct NavNode {
         // Leaf only
         public IBridge? bridge;
@@ -48,16 +48,16 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Group only
         public Direction axis;
-        // Range in NavigationGroup._childIndices that holds this node's child node indices.
-        public int childrenStart;
-        public int childrenCount;
+        // Index of the first child in _nodes, -1 if none.
+        public int firstChild;
         // Index of the child subtree containing the isDefault element, else 0.
         // Used as the landing target when entering this group perpendicularly.
         public int defaultChildIndex;
 
         // Tree structure (set during BuildTree)
-        public int parentIndex;  // index into _nodes, -1 = no parent
-        public int childIndex;   // position within parent's children span
+        public int parentIndex;   // index into _nodes, -1 = no parent
+        public int childIndex;    // position among siblings (0-based)
+        public int nextSibling;   // index into _nodes, -1 = last sibling
 
         public bool IsLeaf => bridge != null;
     }
@@ -73,8 +73,6 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     private readonly List<NavItem> items = new();
     // Navigation tree: all nodes as structs in a flat arena, reused across rebuilds.
     private readonly List<NavNode> _nodes = new();
-    // Flat storage for all children: each group node stores a (start, count) range here.
-    private readonly List<int> _childIndices = new();
     // Index of the root node in _nodes, or -1 when the tree is empty.
     private int _navRootIndex = -1;
     // O(1) lookup from a bridge to its leaf node index in _nodes.
@@ -104,7 +102,6 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     public IReadOnlyList<NavItem> Items => items;
     public IReadOnlyList<NavNode> Nodes => _nodes;
-    public IReadOnlyList<int> ChildIndices => _childIndices;
     public int NavRootIndex => _navRootIndex;
     public IBridge? FocusedBridge => focusedBridge;
     public static IReadOnlyList<NavigationGroup> AllActiveGroups => ActiveGroups;
@@ -118,29 +115,46 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             if (node.IsLeaf) {
                 return node.bridge!;
             }
-            if (node.childrenCount == 0) {
+            if (node.firstChild < 0) {
                 break;
             }
             if (node.axis == axis) {
                 // Parallel: enter from start or end
-                nodeIdx = forward
-                    ? _childIndices[node.childrenStart]
-                    : _childIndices[node.childrenStart + node.childrenCount - 1];
+                nodeIdx = forward ? node.firstChild : LastChild(nodeIdx);
             } else {
                 // Perpendicular: use hint if it lives in this subtree, else fall back to default.
                 int targetIdx = node.defaultChildIndex;
                 if (hint != null) {
-                    for (int i = 0; i < node.childrenCount; i++) {
-                        if (SubtreeContains(_childIndices[node.childrenStart + i], hint)) {
+                    int cur = node.firstChild;
+                    for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling) {
+                        if (SubtreeContains(cur, hint)) {
                             targetIdx = i;
                             break;
                         }
                     }
                 }
-                nodeIdx = _childIndices[node.childrenStart + targetIdx];
+                nodeIdx = ChildAt(nodeIdx, targetIdx);
             }
         }
         return _nodes[nodeIdx].bridge!;
+    }
+
+    // Returns the index of the last child of the node at groupIdx.
+    private int LastChild(int groupIdx) {
+        int cur = _nodes[groupIdx].firstChild;
+        while (_nodes[cur].nextSibling >= 0) {
+            cur = _nodes[cur].nextSibling;
+        }
+        return cur;
+    }
+
+    // Returns the index of the child at sibling position i (0-based).
+    private int ChildAt(int groupIdx, int i) {
+        int cur = _nodes[groupIdx].firstChild;
+        for (int j = 0; j < i && cur >= 0; j++) {
+            cur = _nodes[cur].nextSibling;
+        }
+        return cur;
     }
 
     private bool SubtreeContains(int nodeIdx, IBridge bridge) {
@@ -148,8 +162,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         if (node.IsLeaf) {
             return node.bridge == bridge;
         }
-        for (int i = 0; i < node.childrenCount; i++) {
-            if (SubtreeContains(_childIndices[node.childrenStart + i], bridge)) {
+        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling) {
+            if (SubtreeContains(cur, bridge)) {
                 return true;
             }
         }
@@ -199,7 +213,6 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         _previousBridge = null;
         _navRootIndex = -1;
         _nodes.Clear();
-        _childIndices.Clear();
         _leafLookup.Clear();
         // Domain reloading is off — Rish reuses element instances between play sessions.
         // Reset _prevVisible so the next session's first PropsDidChange detects the visible=true transition.
@@ -361,7 +374,6 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     private void RebuildGraph() {
         _navRootIndex = -1;
         _nodes.Clear();
-        _childIndices.Clear();
         _leafLookup.Clear();
 
         using var interactable = ListPool<(NavItem item, VisualElement ve)>.Take();
@@ -405,8 +417,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         }
 
         // Group elements by the direct child of container that contains each one.
-        // We use a flat list of (containerChildIndex, elemIdx) pairs sorted by key,
-        // then process contiguous runs — avoiding SortedList<int, List<...>> allocations.
+        // Flat list of (containerChildIndex, elemIdx) pairs, sorted by key, then processed
+        // as contiguous runs — avoids SortedList<int, List<...>> allocations.
         using var pairs = ListPool<(int key, int elemIdx)>.Take();
         for (int i = 0; i < elements.Count; i++) {
             var ancestor = FindDirectChildOf(container, elements[i].ve);
@@ -439,7 +451,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             return BuildTree(container.ElementAt(pairs[0].key), elements);
         }
 
-        // Build a child node index for each contiguous run of the same container-child key.
+        // Build one child node per contiguous run of the same container-child key.
+        // Link them as a sibling chain: firstChild → nextSibling → ... → -1.
         using var childNodeIndices = ListPool<int>.Take();
         int runStart = 0;
         while (runStart < pairs.Count) {
@@ -473,35 +486,27 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             return childNodeIndices[0];
         }
 
-        // Write children into the flat _childIndices buffer and record their sibling position.
-        int childrenStart = _childIndices.Count;
-        int childrenCount = childNodeIndices.Count;
-        for (int i = 0; i < childrenCount; i++) {
+        // groupIdx is known before Add() since it will be appended at the current end.
+        int groupIdx = _nodes.Count;
+
+        // Wire up sibling chain and set parent/childIndex on each child.
+        for (int i = 0; i < childNodeIndices.Count; i++) {
             int childIdx = childNodeIndices[i];
-            _childIndices.Add(childIdx);
             var child = _nodes[childIdx];
+            child.parentIndex = groupIdx;
             child.childIndex = i;
+            child.nextSibling = i + 1 < childNodeIndices.Count ? childNodeIndices[i + 1] : -1;
             _nodes[childIdx] = child;
         }
 
-        // Create the group node. parentIndex will be set by our parent's loop.
-        int groupIdx = _nodes.Count;
         _nodes.Add(new NavNode {
             axis = GetFlexAxis(container),
-            childrenStart = childrenStart,
-            childrenCount = childrenCount,
+            firstChild = childNodeIndices[0],
             defaultChildIndex = 0,
             parentIndex = -1,
             childIndex = 0,
+            nextSibling = -1,
         });
-
-        // Set parentIndex on each direct child.
-        for (int i = 0; i < childrenCount; i++) {
-            int childIdx = _childIndices[childrenStart + i];
-            var child = _nodes[childIdx];
-            child.parentIndex = groupIdx;
-            _nodes[childIdx] = child;
-        }
 
         // Find which child subtree contains the isDefault element, so perpendicular entry
         // lands on the correct element (e.g. entering a row of options lands on the active one).
@@ -519,17 +524,19 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             isDefault = item.isDefault,
             isInteractable = item.interactable,
             isBackButton = item.isBackButton,
+            firstChild = -1,
             parentIndex = -1,
             childIndex = 0,
+            nextSibling = -1,
         });
         return idx;
     }
 
     // Descends tree to find which child subtree contains the isDefault element.
     private int FindDefaultChildIndex(int groupIdx) {
-        var node = _nodes[groupIdx];
-        for (int i = 0; i < node.childrenCount; i++) {
-            if (SubtreeContainsDefault(_childIndices[node.childrenStart + i])) {
+        int cur = _nodes[groupIdx].firstChild;
+        for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling) {
+            if (SubtreeContainsDefault(cur)) {
                 return i;
             }
         }
@@ -541,8 +548,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         if (node.IsLeaf) {
             return node.isDefault && node.isInteractable;
         }
-        for (int i = 0; i < node.childrenCount; i++) {
-            if (SubtreeContainsDefault(_childIndices[node.childrenStart + i])) {
+        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling) {
+            if (SubtreeContainsDefault(cur)) {
                 return true;
             }
         }
@@ -623,15 +630,14 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             }
             var group = _nodes[cur.parentIndex];
             if (group.axis == axis) {
-                int nextChildIdx = cur.childIndex + delta;
-                if (nextChildIdx >= 0 && nextChildIdx < group.childrenCount) {
-                    var target = ResolveEntry(
-                        _childIndices[group.childrenStart + nextChildIdx],
-                        axis,
-                        forward: delta > 0,
-                        hint: _previousBridge);
-                    NavigateTo(target);
-                    return;
+                int targetChildIdx = cur.childIndex + delta;
+                if (targetChildIdx >= 0) {
+                    int targetNodeIdx = ChildAt(cur.parentIndex, targetChildIdx);
+                    if (targetNodeIdx >= 0) {
+                        var target = ResolveEntry(targetNodeIdx, axis, forward: delta > 0, hint: _previousBridge);
+                        NavigateTo(target);
+                        return;
+                    }
                 }
                 // At this group's boundary — continue bubbling up to the parent group.
             }
