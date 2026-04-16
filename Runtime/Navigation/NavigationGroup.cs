@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using RishUI;
+using Roots;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -35,7 +36,10 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // Built from the UIToolkit flex layout: each group's axis matches its container's flexDirection.
     // Navigation walks UP the tree to find the nearest ancestor group on the pressed axis, steps
     // to the next sibling, then resolves the entry point by descending into the target subtree.
-    public sealed class NavNode {
+    //
+    // All nodes live in NavigationGroup._nodes (flat arena). Children are referenced via index
+    // ranges into NavigationGroup._childIndices to avoid per-group array allocations.
+    public struct NavNode {
         // Leaf only
         public IBridge? bridge;
         public bool isDefault;
@@ -44,14 +48,16 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Group only
         public Direction axis;
-        public NavNode[]? children;
+        // Range in NavigationGroup._childIndices that holds this node's child node indices.
+        public int childrenStart;
+        public int childrenCount;
         // Index of the child subtree containing the isDefault element, else 0.
         // Used as the landing target when entering this group perpendicularly.
         public int defaultChildIndex;
 
-        // Tree structure (set after construction)
-        public NavNode? parent;
-        public int childIndex;  // index within parent.children
+        // Tree structure (set during BuildTree)
+        public int parentIndex;  // index into _nodes, -1 = no parent
+        public int childIndex;   // position within parent's children span
 
         public bool IsLeaf => bridge != null;
     }
@@ -65,10 +71,14 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // Instance fields: derived/cached data. NOT in a Rish state struct because they are
     // memoized state that must not participate in diffing or trigger re-renders.
     private readonly List<NavItem> items = new();
-    // Navigation tree built from the UIToolkit flex layout hierarchy.
-    private NavNode? _navRoot;
-    // O(1) lookup from a bridge to its leaf node in the tree.
-    private readonly Dictionary<IBridge, NavNode> _leafLookup = new();
+    // Navigation tree: all nodes as structs in a flat arena, reused across rebuilds.
+    private readonly List<NavNode> _nodes = new();
+    // Flat storage for all children: each group node stores a (start, count) range here.
+    private readonly List<int> _childIndices = new();
+    // Index of the root node in _nodes, or -1 when the tree is empty.
+    private int _navRootIndex = -1;
+    // O(1) lookup from a bridge to its leaf node index in _nodes.
+    private readonly Dictionary<IBridge, int> _leafLookup = new();
     private bool graphDirty;
     private IBridge? focusedBridge;
     // The element focused before the current one, set only on explicit user navigation.
@@ -93,47 +103,53 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // --- Internal accessors for NavigationGroupDebugOverlay ---
 
     public IReadOnlyList<NavItem> Items => items;
-    public NavNode? NavRoot => _navRoot;
+    public IReadOnlyList<NavNode> Nodes => _nodes;
+    public IReadOnlyList<int> ChildIndices => _childIndices;
+    public int NavRootIndex => _navRootIndex;
     public IBridge? FocusedBridge => focusedBridge;
     public static IReadOnlyList<NavigationGroup> AllActiveGroups => ActiveGroups;
 
     // Resolves the entry/exit point of a subtree for a given axis and direction.
     // hint: if set, perpendicular groups prefer the child subtree containing hint over defaultChildIndex.
     // Exposed for the debug overlay so it can draw accurate connection lines (hint=null).
-    public static IBridge ResolveEntry(NavNode node, Direction axis, bool forward, IBridge? hint = null) {
-        while (!node.IsLeaf) {
-            if (node.children == null || node.children.Length == 0) {
+    public IBridge ResolveEntry(int nodeIdx, Direction axis, bool forward, IBridge? hint = null) {
+        while (true) {
+            var node = _nodes[nodeIdx];
+            if (node.IsLeaf) {
+                return node.bridge!;
+            }
+            if (node.childrenCount == 0) {
                 break;
             }
             if (node.axis == axis) {
                 // Parallel: enter from start or end
-                node = forward ? node.children[0] : node.children[node.children.Length - 1];
+                nodeIdx = forward
+                    ? _childIndices[node.childrenStart]
+                    : _childIndices[node.childrenStart + node.childrenCount - 1];
             } else {
                 // Perpendicular: use hint if it lives in this subtree, else fall back to default.
                 int targetIdx = node.defaultChildIndex;
                 if (hint != null) {
-                    for (int i = 0; i < node.children.Length; i++) {
-                        if (SubtreeContains(node.children[i], hint)) {
+                    for (int i = 0; i < node.childrenCount; i++) {
+                        if (SubtreeContains(_childIndices[node.childrenStart + i], hint)) {
                             targetIdx = i;
                             break;
                         }
                     }
                 }
-                node = node.children[targetIdx];
+                nodeIdx = _childIndices[node.childrenStart + targetIdx];
             }
         }
-        return node.bridge!;
+        return _nodes[nodeIdx].bridge!;
     }
 
-    private static bool SubtreeContains(NavNode node, IBridge bridge) {
+    private bool SubtreeContains(int nodeIdx, IBridge bridge) {
+        var node = _nodes[nodeIdx];
         if (node.IsLeaf) {
             return node.bridge == bridge;
         }
-        if (node.children == null) {
-            return false;
-        }
-        foreach (var child in node.children) {
-            if (SubtreeContains(child, bridge)) {
+        for (int i = 0; i < node.childrenCount; i++) {
+            if (SubtreeContains(_childIndices[node.childrenStart + i], bridge)) {
                 return true;
             }
         }
@@ -181,7 +197,9 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             focusedBridge = null;
         }
         _previousBridge = null;
-        _navRoot = null;
+        _navRootIndex = -1;
+        _nodes.Clear();
+        _childIndices.Clear();
         _leafLookup.Clear();
         // Domain reloading is off — Rish reuses element instances between play sessions.
         // Reset _prevVisible so the next session's first PropsDidChange detects the visible=true transition.
@@ -341,10 +359,12 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // --- Navigation tree ---
 
     private void RebuildGraph() {
-        _navRoot = null;
+        _navRootIndex = -1;
+        _nodes.Clear();
+        _childIndices.Clear();
         _leafLookup.Clear();
 
-        var interactable = new List<(NavItem item, VisualElement ve)>();
+        using var interactable = ListPool<(NavItem item, VisualElement ve)>.Take();
         foreach (var item in items) {
             if (!item.interactable) {
                 continue;
@@ -359,33 +379,37 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         var rootVe = GetVisualChild();
         if (rootVe != null && interactable.Count >= 1) {
-            _navRoot = BuildTree(rootVe, interactable);
+            _navRootIndex = BuildTree(rootVe, interactable.list);
         }
-        if (_navRoot != null) {
-            BuildLeafLookup(_navRoot);
+
+        // Linear scan is simpler and cheaper than recursive traversal.
+        for (int i = 0; i < _nodes.Count; i++) {
+            if (_nodes[i].IsLeaf) {
+                _leafLookup[_nodes[i].bridge!] = i;
+            }
         }
 
         graphDirty = false;
     }
 
     // Recursively maps the interactable elements onto the UIToolkit flex tree, bottom-up.
-    // Each call returns a NavNode representing the subtree rooted at `container`.
+    // Returns the index of the resulting node in _nodes, or -1 if no node was produced.
     // Single-child transparent wrappers are collapsed. Multi-child containers become group nodes
     // whose axis matches the container's flex direction.
-    private static NavNode? BuildTree(
-        VisualElement container,
-        List<(NavItem item, VisualElement ve)> elements) {
+    private int BuildTree(VisualElement container, List<(NavItem item, VisualElement ve)> elements) {
         if (elements.Count == 0) {
-            return null;
+            return -1;
         }
         if (elements.Count == 1) {
             return MakeLeaf(elements[0].item);
         }
 
         // Group elements by the direct child of container that contains each one.
-        var groups = new SortedList<int, List<(NavItem item, VisualElement ve)>>();
-        foreach (var elem in elements) {
-            var ancestor = FindDirectChildOf(container, elem.ve);
+        // We use a flat list of (containerChildIndex, elemIdx) pairs sorted by key,
+        // then process contiguous runs — avoiding SortedList<int, List<...>> allocations.
+        using var pairs = ListPool<(int key, int elemIdx)>.Take();
+        for (int i = 0; i < elements.Count; i++) {
+            var ancestor = FindDirectChildOf(container, elements[i].ve);
             if (ancestor == null) {
                 continue;
             }
@@ -393,91 +417,132 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             if (idx < 0) {
                 continue;
             }
-            if (!groups.ContainsKey(idx)) {
-                groups[idx] = new List<(NavItem, VisualElement)>();
+            pairs.Add((idx, i));
+        }
+
+        if (pairs.Count == 0) {
+            return -1;
+        }
+
+        pairs.list.Sort((a, b) => a.key.CompareTo(b.key));
+
+        // Count distinct container-child keys to detect transparent wrappers.
+        int distinctKeys = 1;
+        for (int i = 1; i < pairs.Count; i++) {
+            if (pairs[i].key != pairs[i - 1].key) {
+                distinctKeys++;
             }
-            groups[idx].Add(elem);
         }
 
-        if (groups.Count == 0) {
-            return null;
+        // Transparent wrapper: all elements fall under a single child — descend into it.
+        if (distinctKeys == 1) {
+            return BuildTree(container.ElementAt(pairs[0].key), elements);
         }
 
-        // Transparent wrapper: all elements under a single child — descend into it.
-        if (groups.Count == 1) {
-            return BuildTree(container.ElementAt(groups.Keys[0]), groups.Values[0]);
-        }
+        // Build a child node index for each contiguous run of the same container-child key.
+        using var childNodeIndices = ListPool<int>.Take();
+        int runStart = 0;
+        while (runStart < pairs.Count) {
+            int runKey = pairs[runStart].key;
+            int runEnd = runStart + 1;
+            while (runEnd < pairs.Count && pairs[runEnd].key == runKey) {
+                runEnd++;
+            }
 
-        // Build a group node whose children map to each sibling group, processed bottom-up.
-        var axis = GetFlexAxis(container);
-        var children = new List<NavNode>(groups.Count);
-        for (int i = 0; i < groups.Count; i++) {
-            var group = groups.Values[i];
-            NavNode child;
-            if (group.Count == 1) {
-                child = MakeLeaf(group[0].item);
+            int childIdx;
+            if (runEnd - runStart == 1) {
+                childIdx = MakeLeaf(elements[pairs[runStart].elemIdx].item);
             } else {
-                var subtree = BuildTree(container.ElementAt(groups.Keys[i]), group);
-                if (subtree == null) {
-                    continue;
+                using var subElems = ListPool<(NavItem item, VisualElement ve)>.Take();
+                for (int i = runStart; i < runEnd; i++) {
+                    subElems.Add(elements[pairs[i].elemIdx]);
                 }
-                child = subtree;
+                childIdx = BuildTree(container.ElementAt(runKey), subElems.list);
             }
-            child.childIndex = children.Count;
-            children.Add(child);
+
+            if (childIdx >= 0) {
+                childNodeIndices.Add(childIdx);
+            }
+            runStart = runEnd;
         }
 
-        if (children.Count == 0) {
-            return null;
+        if (childNodeIndices.Count == 0) {
+            return -1;
         }
-        if (children.Count == 1) {
-            return children[0];
+        if (childNodeIndices.Count == 1) {
+            return childNodeIndices[0];
         }
 
-        var node = new NavNode {
-            axis = axis,
-            children = children.ToArray(),
+        // Write children into the flat _childIndices buffer and record their sibling position.
+        int childrenStart = _childIndices.Count;
+        int childrenCount = childNodeIndices.Count;
+        for (int i = 0; i < childrenCount; i++) {
+            int childIdx = childNodeIndices[i];
+            _childIndices.Add(childIdx);
+            var child = _nodes[childIdx];
+            child.childIndex = i;
+            _nodes[childIdx] = child;
+        }
+
+        // Create the group node. parentIndex will be set by our parent's loop.
+        int groupIdx = _nodes.Count;
+        _nodes.Add(new NavNode {
+            axis = GetFlexAxis(container),
+            childrenStart = childrenStart,
+            childrenCount = childrenCount,
             defaultChildIndex = 0,
-        };
-        foreach (var child in node.children) {
-            child.parent = node;
+            parentIndex = -1,
+            childIndex = 0,
+        });
+
+        // Set parentIndex on each direct child.
+        for (int i = 0; i < childrenCount; i++) {
+            int childIdx = _childIndices[childrenStart + i];
+            var child = _nodes[childIdx];
+            child.parentIndex = groupIdx;
+            _nodes[childIdx] = child;
         }
+
         // Find which child subtree contains the isDefault element, so perpendicular entry
         // lands on the correct element (e.g. entering a row of options lands on the active one).
-        node.defaultChildIndex = FindDefaultChildIndex(node);
-        return node;
+        var groupNode = _nodes[groupIdx];
+        groupNode.defaultChildIndex = FindDefaultChildIndex(groupIdx);
+        _nodes[groupIdx] = groupNode;
+
+        return groupIdx;
     }
 
-    private static NavNode MakeLeaf(NavItem item) =>
-        new NavNode {
+    private int MakeLeaf(NavItem item) {
+        int idx = _nodes.Count;
+        _nodes.Add(new NavNode {
             bridge = item.bridge,
             isDefault = item.isDefault,
             isInteractable = item.interactable,
             isBackButton = item.isBackButton,
-        };
+            parentIndex = -1,
+            childIndex = 0,
+        });
+        return idx;
+    }
 
     // Descends tree to find which child subtree contains the isDefault element.
-    private static int FindDefaultChildIndex(NavNode node) {
-        if (node.children == null) {
-            return 0;
-        }
-        for (int i = 0; i < node.children.Length; i++) {
-            if (SubtreeContainsDefault(node.children[i])) {
+    private int FindDefaultChildIndex(int groupIdx) {
+        var node = _nodes[groupIdx];
+        for (int i = 0; i < node.childrenCount; i++) {
+            if (SubtreeContainsDefault(_childIndices[node.childrenStart + i])) {
                 return i;
             }
         }
         return 0;
     }
 
-    private static bool SubtreeContainsDefault(NavNode node) {
+    private bool SubtreeContainsDefault(int nodeIdx) {
+        var node = _nodes[nodeIdx];
         if (node.IsLeaf) {
             return node.isDefault && node.isInteractable;
         }
-        if (node.children == null) {
-            return false;
-        }
-        foreach (var child in node.children) {
-            if (SubtreeContainsDefault(child)) {
+        for (int i = 0; i < node.childrenCount; i++) {
+            if (SubtreeContainsDefault(_childIndices[node.childrenStart + i])) {
                 return true;
             }
         }
@@ -499,18 +564,6 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         return (fd == FlexDirection.Row || fd == FlexDirection.RowReverse)
             ? Direction.Horizontal
             : Direction.Vertical;
-    }
-
-    private void BuildLeafLookup(NavNode node) {
-        if (node.IsLeaf) {
-            _leafLookup[node.bridge!] = node;
-            return;
-        }
-        if (node.children != null) {
-            foreach (var child in node.children) {
-                BuildLeafLookup(child);
-            }
-        }
     }
 
     // --- Input handlers ---
@@ -555,7 +608,7 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Walk the navigation tree: bubble up until we find an ancestor group on the pressed axis
         // that has a sibling in the pressed direction, then descend into it.
-        if (_navRoot == null || !_leafLookup.TryGetValue(focusedBridge, out var node)) {
+        if (_navRootIndex < 0 || !_leafLookup.TryGetValue(focusedBridge, out var curIdx)) {
             return;
         }
 
@@ -563,18 +616,26 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         // Formula: (H axis == positive) maps (H,Right→+1) and (V,Down→+1), (H,Left→-1) and (V,Up→-1).
         int delta = (axis == Direction.Horizontal) == positive ? 1 : -1;
 
-        while (node.parent != null) {
-            var group = node.parent;
+        while (true) {
+            var cur = _nodes[curIdx];
+            if (cur.parentIndex < 0) {
+                break;
+            }
+            var group = _nodes[cur.parentIndex];
             if (group.axis == axis) {
-                int nextIdx = node.childIndex + delta;
-                if (nextIdx >= 0 && nextIdx < group.children!.Length) {
-                    var target = ResolveEntry(group.children[nextIdx], axis, forward: delta > 0, hint: _previousBridge);
+                int nextChildIdx = cur.childIndex + delta;
+                if (nextChildIdx >= 0 && nextChildIdx < group.childrenCount) {
+                    var target = ResolveEntry(
+                        _childIndices[group.childrenStart + nextChildIdx],
+                        axis,
+                        forward: delta > 0,
+                        hint: _previousBridge);
                     NavigateTo(target);
                     return;
                 }
                 // At this group's boundary — continue bubbling up to the parent group.
             }
-            node = group;
+            curIdx = cur.parentIndex;
         }
     }
 
