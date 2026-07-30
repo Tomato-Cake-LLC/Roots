@@ -7,9 +7,12 @@ using UnityEngine;
 using UnityEngine.UIElements;
 
 [RishValueType]
-public struct NavigationGroupProps {
+public struct NavigationGroupProps
+{
     public Element content;
     public bool visible;
+    // Handles Cancel (B/Escape) for this layer. Falls back to the isBackButton item when null
+    public Action onCancel;
 }
 
 // Wraps a set of navigable elements and provides gamepad/keyboard navigation between them.
@@ -19,10 +22,12 @@ public struct NavigationGroupProps {
 // Elements register automatically: any Div.Create(navigable: ...) inside this group causes
 // Bridge to call INavigationRegistrar.RegisterNavigable when the element mounts.
 public partial class NavigationGroup : RishElement<NavigationGroupProps>,
-    IMountingListener, IPropsListener, INavigationRegistrar {
+    IMountingListener, IPropsListener, INavigationRegistrar
+{
     public enum Direction { Vertical, Horizontal }
 
-    public struct NavItem {
+    public struct NavItem
+    {
         public IBridge bridge;
         public bool interactable;
         // Focused first when this group becomes active. Falls back to first interactable.
@@ -38,7 +43,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     //
     // All nodes live in NavigationGroup._nodes (flat arena). Children and siblings are linked
     // by index — no heap allocations per node or per rebuild.
-    public struct NavNode {
+    public struct NavNode
+    {
         // Leaf only
         public IBridge? bridge;
         public bool isDefault;
@@ -108,25 +114,35 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // Resolves the entry/exit point of a subtree for a given axis and direction.
     // hint: if set, perpendicular groups prefer the child subtree containing hint over defaultChildIndex.
     // Exposed for the debug overlay so it can draw accurate connection lines (hint=null).
-    public IBridge ResolveEntry(int nodeIdx, Direction axis, bool forward, IBridge? hint = null) {
-        while (true) {
+    public IBridge ResolveEntry(int nodeIdx, Direction axis, bool forward, IBridge? hint = null)
+    {
+        while (true)
+        {
             var node = _nodes[nodeIdx];
-            if (node.IsLeaf) {
+            if (node.IsLeaf)
+            {
                 return node.bridge!;
             }
-            if (node.firstChild < 0) {
+            if (node.firstChild < 0)
+            {
                 break;
             }
-            if (node.axis == axis) {
+            if (node.axis == axis)
+            {
                 // Parallel: enter from start or end
                 nodeIdx = forward ? node.firstChild : LastChild(nodeIdx);
-            } else {
+            }
+            else
+            {
                 // Perpendicular: use hint if it lives in this subtree, else fall back to default.
                 int targetIdx = node.defaultChildIndex;
-                if (hint != null) {
+                if (hint != null)
+                {
                     int cur = node.firstChild;
-                    for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling) {
-                        if (SubtreeContains(cur, hint)) {
+                    for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling)
+                    {
+                        if (SubtreeContains(cur, hint))
+                        {
                             targetIdx = i;
                             break;
                         }
@@ -139,30 +155,38 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     }
 
     // Returns the index of the last child of the node at groupIdx.
-    private int LastChild(int groupIdx) {
+    private int LastChild(int groupIdx)
+    {
         int cur = _nodes[groupIdx].firstChild;
-        while (_nodes[cur].nextSibling >= 0) {
+        while (_nodes[cur].nextSibling >= 0)
+        {
             cur = _nodes[cur].nextSibling;
         }
         return cur;
     }
 
     // Returns the node index of the child at sibling position i (0-based).
-    private int ChildAt(int groupIdx, int i) {
+    private int ChildAt(int groupIdx, int i)
+    {
         int cur = _nodes[groupIdx].firstChild;
-        for (int j = 0; j < i && cur >= 0; j++) {
+        for (int j = 0; j < i && cur >= 0; j++)
+        {
             cur = _nodes[cur].nextSibling;
         }
         return cur;
     }
 
-    private bool SubtreeContains(int nodeIdx, IBridge bridge) {
+    private bool SubtreeContains(int nodeIdx, IBridge bridge)
+    {
         var node = _nodes[nodeIdx];
-        if (node.IsLeaf) {
+        if (node.IsLeaf)
+        {
             return node.bridge == bridge;
         }
-        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling) {
-            if (SubtreeContains(cur, bridge)) {
+        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling)
+        {
+            if (SubtreeContains(cur, bridge))
+            {
                 return true;
             }
         }
@@ -171,20 +195,24 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // --- Lifecycle ---
 
-    void IMountingListener.ElementDidMount() {
+    void IMountingListener.ElementDidMount()
+    {
         // Subscribe to the NavigationContext provider. NavigationContext is an ancestor in the
         // Rish node tree; GetFirstAncestorOfType walks up to find it.
         // Fall back to SharedProvider directly if NavigationContext is not in the tree yet.
         var ctx = GetFirstAncestorOfType<NavigationContext>();
         _provider = ctx?.Provider ?? NavigationContext.SharedProvider;
 
-        if (_provider != null) {
+        if (_provider != null)
+        {
             _provider.Navigate += OnNavigate;
             _provider.NavigateCanceled += OnNavigateCanceled;
             _provider.Submit += OnSubmit;
             _provider.SubmitEnded += OnSubmitEnded;
             _provider.Cancel += OnCancel;
-        } else {
+        }
+        else
+        {
             Debug.LogError("[NavigationGroup] No INavigationEventProvider found. Set NavigationContext.SharedProvider before mounting.");
         }
 
@@ -194,8 +222,10 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         // so a visible:true initial prop correctly triggers PushAndFocus).
     }
 
-    void IMountingListener.ElementWillUnmount() {
-        if (_provider != null) {
+    void IMountingListener.ElementWillUnmount()
+    {
+        if (_provider != null)
+        {
             _provider.Navigate -= OnNavigate;
             _provider.NavigateCanceled -= OnNavigateCanceled;
             _provider.Submit -= OnSubmit;
@@ -205,7 +235,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         }
 
         ActiveGroups.Remove(this);
-        if (focusedBridge != null) {
+        if (focusedBridge != null)
+        {
             SetBridgeFocus(focusedBridge, false);
             focusedBridge = null;
         }
@@ -220,19 +251,26 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         graphDirty = true;
     }
 
-    void IPropsListener.PropsWillChange() {
+    void IPropsListener.PropsWillChange()
+    {
         _prevVisible = Props.visible;
     }
 
-    void IPropsListener.PropsDidChange() {
-        if (Props.visible == _prevVisible) {
+    void IPropsListener.PropsDidChange()
+    {
+        if (Props.visible == _prevVisible)
+        {
             return;
         }
-        if (Props.visible) {
+        if (Props.visible)
+        {
             PushAndFocus();
-        } else {
+        }
+        else
+        {
             ActiveGroups.Remove(this);
-            if (focusedBridge != null) {
+            if (focusedBridge != null)
+            {
                 SetBridgeFocus(focusedBridge, false);
                 focusedBridge = null;
             }
@@ -244,8 +282,10 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // --- INavigationRegistrar ---
 
-    void INavigationRegistrar.RegisterNavigable(IBridge bridge, Navigable nav) {
-        items.Add(new NavItem {
+    void INavigationRegistrar.RegisterNavigable(IBridge bridge, Navigable nav)
+    {
+        items.Add(new NavItem
+        {
             bridge = bridge,
             interactable = nav.interactable,
             isDefault = nav.isDefault,
@@ -255,30 +295,38 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         // PushAndFocus fires before elements register. Focus the first eligible element on late
         // registration. If an isDefault item registers after a non-default was already focused,
         // re-run FocusDefault so the intended default wins.
-        if (IsTop && (focusedBridge == null || nav.isDefault)) {
+        if (IsTop && (focusedBridge == null || nav.isDefault))
+        {
             FocusDefault();
         }
         // Eagerly build the graph when we're the active group so the debug overlay shows arrows
         // without needing a keypress, and navigation works as soon as the first key is pressed.
-        // If bounds are zero (layout not done), schedule a retry on the next UIToolkit update.
-        if (IsTop) {
+        if (IsTop)
+        {
             RebuildGraph();
-            if (graphDirty) {
-                GetVisualChild()?.schedule.Execute(() => {
-                    if (graphDirty && IsTop) {
-                        RebuildGraph();
-                    }
-                }).StartingIn(0);
-            }
+            // Always rebuild once more after layout. Group axes come from resolvedStyle
+            // flexDirection, which reports the Column default until a layout pass has run — so a
+            // build that passed the bounds check can still have every axis wrong.
+            GetVisualChild()?.schedule.Execute(() =>
+            {
+                if (IsTop)
+                {
+                    graphDirty = true;
+                    RebuildGraph();
+                }
+            }).StartingIn(0);
         }
     }
 
-    void INavigationRegistrar.UnregisterNavigable(IBridge bridge) {
+    void INavigationRegistrar.UnregisterNavigable(IBridge bridge)
+    {
         int idx = items.FindIndex(i => i.bridge == bridge);
-        if (idx < 0) {
+        if (idx < 0)
+        {
             throw new InvalidOperationException("NavigationGroup.UnregisterNavigable: bridge was not registered");
         }
-        if (focusedBridge == bridge) {
+        if (focusedBridge == bridge)
+        {
             SetBridgeFocus(bridge, false);
             focusedBridge = null;
         }
@@ -286,9 +334,11 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         graphDirty = true;
     }
 
-    void INavigationRegistrar.UpdateNavigable(IBridge bridge, Navigable nav) {
+    void INavigationRegistrar.UpdateNavigable(IBridge bridge, Navigable nav)
+    {
         int idx = items.FindIndex(i => i.bridge == bridge);
-        if (idx < 0) {
+        if (idx < 0)
+        {
             throw new InvalidOperationException("NavigationGroup.UpdateNavigable: bridge was not registered");
         }
         var item = items[idx];
@@ -299,7 +349,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         graphDirty = true;
     }
 
-    void INavigationRegistrar.SetFocused(IBridge bridge, bool focused) {
+    void INavigationRegistrar.SetFocused(IBridge bridge, bool focused)
+    {
         SetBridgeFocus(bridge, focused);
     }
 
@@ -307,9 +358,12 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // Clears all active groups and removes focus — call before triggering a scene load so
     // the player can't navigate while the load is in progress.
-    public static void DisableAll() {
-        foreach (var group in ActiveGroups) {
-            if (group.focusedBridge != null) {
+    public static void DisableAll()
+    {
+        foreach (var group in ActiveGroups)
+        {
+            if (group.focusedBridge != null)
+            {
                 SetBridgeFocus(group.focusedBridge, false);
                 group.focusedBridge = null;
             }
@@ -318,21 +372,27 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         ActiveGroups.Clear();
     }
 
-    private void PushAndFocus() {
+    private void PushAndFocus()
+    {
         ActiveGroups.Add(this);
         FocusDefault();
     }
 
-    private void FocusDefault() {
+    private void FocusDefault()
+    {
         // Prefer the explicitly designated default button, then fall back to first interactable.
-        foreach (var item in items) {
-            if (item.isDefault && item.interactable) {
+        foreach (var item in items)
+        {
+            if (item.isDefault && item.interactable)
+            {
                 FocusItem(item.bridge);
                 return;
             }
         }
-        foreach (var item in items) {
-            if (item.interactable) {
+        foreach (var item in items)
+        {
+            if (item.interactable)
+            {
                 FocusItem(item.bridge);
                 return;
             }
@@ -340,14 +400,17 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     }
 
     // Records history then focuses — call only from OnNavigate (user-initiated movement).
-    private void NavigateTo(IBridge bridge) {
+    private void NavigateTo(IBridge bridge)
+    {
         _previousBridge = focusedBridge;
         FocusItem(bridge);
     }
 
     // Focuses without updating _previousBridge — call from FocusDefault and registration paths.
-    private void FocusItem(IBridge bridge) {
-        if (focusedBridge != null) {
+    private void FocusItem(IBridge bridge)
+    {
+        if (focusedBridge != null)
+        {
             SetBridgeFocus(focusedBridge, false);
         }
         focusedBridge = bridge;
@@ -356,9 +419,11 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // Applies or removes the UIToolkit :focus pseudo-state via Plan B (direct bit flip),
     // and fires the Navigable.onFocusChanged callback for side effects.
-    private static void SetBridgeFocus(IBridge bridge, bool focused) {
+    private static void SetBridgeFocus(IBridge bridge, bool focused)
+    {
         var ve = bridge.Element;
-        if (ve == null) {
+        if (ve == null)
+        {
             return;
         }
         int bits = ve.GetPseudoStates();
@@ -386,7 +451,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     private static readonly List<(int key, int elemIdx)> s_pairs = new();
     private static readonly List<(VisualElement container, int elemsStart, int elemsCount, int resultSlot)> s_runs = new();
 
-    private struct BuildFrame {
+    private struct BuildFrame
+    {
         // When false: compute the NavNode for (container, elements slice).
         // When true:  collect child results and build the group node.
         public bool isAwait;
@@ -404,32 +470,39 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         public int childResultsStart, childCount;
     }
 
-    private void RebuildGraph() {
+    private void RebuildGraph()
+    {
         _navRootIndex = -1;
         _nodes.Clear();
         _leafLookup.Clear();
         s_elemsBuffer.Clear();
 
-        foreach (var item in items) {
-            if (!item.interactable) {
+        foreach (var item in items)
+        {
+            if (!item.interactable)
+            {
                 continue;
             }
             // Defer if layout hasn't run yet — graph will rebuild on the next navigate input.
             var bounds = item.bridge.Element.worldBound;
-            if (bounds.width == 0f && bounds.height == 0f) {
+            if (bounds.width == 0f && bounds.height == 0f)
+            {
                 return;
             }
             s_elemsBuffer.Add((item, item.bridge.Element));
         }
 
         var rootVe = GetVisualChild();
-        if (rootVe != null && s_elemsBuffer.Count >= 1) {
+        if (rootVe != null && s_elemsBuffer.Count >= 1)
+        {
             _navRootIndex = BuildTree(rootVe);
         }
 
         // Linear scan is simpler and cheaper than recursive traversal.
-        for (int i = 0; i < _nodes.Count; i++) {
-            if (_nodes[i].IsLeaf) {
+        for (int i = 0; i < _nodes.Count; i++)
+        {
+            if (_nodes[i].IsLeaf)
+            {
                 _leafLookup[_nodes[i].bridge!] = i;
             }
         }
@@ -444,11 +517,13 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // then push an Await frame (which will build the group node) followed by child Setup frames
     // in reverse order (so child 0 runs first off the stack).
     // Await frames run after all their children and wire up the sibling chain + group node.
-    private int BuildTree(VisualElement rootContainer) {
+    private int BuildTree(VisualElement rootContainer)
+    {
         s_stack.Clear();
         s_childResults.Clear();
 
-        s_stack.Add(new BuildFrame {
+        s_stack.Add(new BuildFrame
+        {
             container = rootContainer,
             elemsStart = 0,
             elemsCount = s_elemsBuffer.Count,
@@ -457,13 +532,17 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         int rootResult = -1;
 
-        while (s_stack.Count > 0) {
+        while (s_stack.Count > 0)
+        {
             var frame = s_stack[^1];
             s_stack.RemoveAt(s_stack.Count - 1);
 
-            if (frame.isAwait) {
+            if (frame.isAwait)
+            {
                 ProcessAwaitFrame(frame, ref rootResult);
-            } else {
+            }
+            else
+            {
                 ProcessSetupFrame(frame, ref rootResult);
             }
         }
@@ -471,25 +550,32 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         return rootResult;
     }
 
-    private void ProcessAwaitFrame(BuildFrame frame, ref int rootResult) {
+    private void ProcessAwaitFrame(BuildFrame frame, ref int rootResult)
+    {
         // Count children that produced a valid node (some runs may return -1 if empty).
         int validCount = 0;
-        for (int i = 0; i < frame.childCount; i++) {
-            if (s_childResults[frame.childResultsStart + i] >= 0) {
+        for (int i = 0; i < frame.childCount; i++)
+        {
+            if (s_childResults[frame.childResultsStart + i] >= 0)
+            {
                 validCount++;
             }
         }
 
-        if (validCount == 0) {
+        if (validCount == 0)
+        {
             WriteResult(frame.resultSlot, -1, ref rootResult);
             return;
         }
 
         // If only one valid child survived, pass it through without wrapping in a group.
-        if (validCount == 1) {
-            for (int i = 0; i < frame.childCount; i++) {
+        if (validCount == 1)
+        {
+            for (int i = 0; i < frame.childCount; i++)
+            {
                 int r = s_childResults[frame.childResultsStart + i];
-                if (r >= 0) {
+                if (r >= 0)
+                {
                     WriteResult(frame.resultSlot, r, ref rootResult);
                     return;
                 }
@@ -498,7 +584,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Build a group node and wire up the sibling chain.
         int groupIdx = _nodes.Count;
-        _nodes.Add(new NavNode {
+        _nodes.Add(new NavNode
+        {
             axis = frame.axis,
             firstChild = -1,
             defaultChildIndex = 0,
@@ -510,12 +597,15 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         int prevChildIdx = -1;
         int firstChildIdx = -1;
         int childPos = 0;
-        for (int i = 0; i < frame.childCount; i++) {
+        for (int i = 0; i < frame.childCount; i++)
+        {
             int childNodeIdx = s_childResults[frame.childResultsStart + i];
-            if (childNodeIdx < 0) {
+            if (childNodeIdx < 0)
+            {
                 continue;
             }
-            if (firstChildIdx < 0) {
+            if (firstChildIdx < 0)
+            {
                 firstChildIdx = childNodeIdx;
             }
             var child = _nodes[childNodeIdx];
@@ -523,7 +613,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             child.childIndex = childPos++;
             _nodes[childNodeIdx] = child;
 
-            if (prevChildIdx >= 0) {
+            if (prevChildIdx >= 0)
+            {
                 var prev = _nodes[prevChildIdx];
                 prev.nextSibling = childNodeIdx;
                 _nodes[prevChildIdx] = prev;
@@ -541,32 +632,39 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         WriteResult(frame.resultSlot, groupIdx, ref rootResult);
     }
 
-    private void ProcessSetupFrame(BuildFrame frame, ref int rootResult) {
-        if (frame.elemsCount == 0) {
+    private void ProcessSetupFrame(BuildFrame frame, ref int rootResult)
+    {
+        if (frame.elemsCount == 0)
+        {
             WriteResult(frame.resultSlot, -1, ref rootResult);
             return;
         }
-        if (frame.elemsCount == 1) {
+        if (frame.elemsCount == 1)
+        {
             WriteResult(frame.resultSlot, MakeLeaf(s_elemsBuffer[frame.elemsStart].item), ref rootResult);
             return;
         }
 
         // Group elements by the direct child of container that contains each one.
         s_pairs.Clear();
-        for (int i = 0; i < frame.elemsCount; i++) {
+        for (int i = 0; i < frame.elemsCount; i++)
+        {
             var ve = s_elemsBuffer[frame.elemsStart + i].ve;
             var ancestor = FindDirectChildOf(frame.container!, ve);
-            if (ancestor == null) {
+            if (ancestor == null)
+            {
                 continue;
             }
             int idx = frame.container!.IndexOf(ancestor);
-            if (idx < 0) {
+            if (idx < 0)
+            {
                 continue;
             }
             s_pairs.Add((idx, frame.elemsStart + i));
         }
 
-        if (s_pairs.Count == 0) {
+        if (s_pairs.Count == 0)
+        {
             WriteResult(frame.resultSlot, -1, ref rootResult);
             return;
         }
@@ -575,16 +673,20 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Count distinct container-child keys to detect transparent wrappers.
         int distinctKeys = 1;
-        for (int i = 1; i < s_pairs.Count; i++) {
-            if (s_pairs[i].key != s_pairs[i - 1].key) {
+        for (int i = 1; i < s_pairs.Count; i++)
+        {
+            if (s_pairs[i].key != s_pairs[i - 1].key)
+            {
                 distinctKeys++;
             }
         }
 
         // Transparent wrapper: all elements fall under a single child — reuse element slice,
         // push a new Setup frame for the child container (equivalent to a tail call).
-        if (distinctKeys == 1) {
-            s_stack.Add(new BuildFrame {
+        if (distinctKeys == 1)
+        {
+            s_stack.Add(new BuildFrame
+            {
                 container = frame.container!.ElementAt(s_pairs[0].key),
                 elemsStart = frame.elemsStart,
                 elemsCount = frame.elemsCount,
@@ -600,23 +702,29 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         int childResultsStart = s_childResults.Count;
         int runNum = 0;
         int runStart = 0;
-        while (runStart < s_pairs.Count) {
+        while (runStart < s_pairs.Count)
+        {
             int runKey = s_pairs[runStart].key;
             int runEnd = runStart + 1;
-            while (runEnd < s_pairs.Count && s_pairs[runEnd].key == runKey) {
+            while (runEnd < s_pairs.Count && s_pairs[runEnd].key == runKey)
+            {
                 runEnd++;
             }
 
             // Reserve a result slot for this run.
             s_childResults.Add(-1);
 
-            if (runEnd - runStart == 1) {
+            if (runEnd - runStart == 1)
+            {
                 // Single element: make the leaf now, write directly to the slot.
                 s_childResults[childResultsStart + runNum] = MakeLeaf(s_elemsBuffer[s_pairs[runStart].elemIdx].item);
-            } else {
+            }
+            else
+            {
                 // Multi-element: copy this run's elements to the buffer tail for the child frame.
                 int childElemsStart = s_elemsBuffer.Count;
-                for (int i = runStart; i < runEnd; i++) {
+                for (int i = runStart; i < runEnd; i++)
+                {
                     s_elemsBuffer.Add(s_elemsBuffer[s_pairs[i].elemIdx]);
                 }
                 s_runs.Add((frame.container!.ElementAt(runKey), childElemsStart, runEnd - runStart, childResultsStart + runNum));
@@ -627,7 +735,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         }
 
         // Push Await frame first — it runs after all children complete.
-        s_stack.Add(new BuildFrame {
+        s_stack.Add(new BuildFrame
+        {
             isAwait = true,
             axis = GetFlexAxis(frame.container!),
             childResultsStart = childResultsStart,
@@ -636,9 +745,11 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         });
 
         // Push child Setup frames in reverse order so child 0 is on top and runs first.
-        for (int i = s_runs.Count - 1; i >= 0; i--) {
+        for (int i = s_runs.Count - 1; i >= 0; i--)
+        {
             var (container, elemsStart, elemsCount, resultSlot) = s_runs[i];
-            s_stack.Add(new BuildFrame {
+            s_stack.Add(new BuildFrame
+            {
                 container = container,
                 elemsStart = elemsStart,
                 elemsCount = elemsCount,
@@ -647,17 +758,23 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         }
     }
 
-    private static void WriteResult(int resultSlot, int nodeIdx, ref int rootResult) {
-        if (resultSlot < 0) {
+    private static void WriteResult(int resultSlot, int nodeIdx, ref int rootResult)
+    {
+        if (resultSlot < 0)
+        {
             rootResult = nodeIdx;
-        } else {
+        }
+        else
+        {
             s_childResults[resultSlot] = nodeIdx;
         }
     }
 
-    private int MakeLeaf(NavItem item) {
+    private int MakeLeaf(NavItem item)
+    {
         int idx = _nodes.Count;
-        _nodes.Add(new NavNode {
+        _nodes.Add(new NavNode
+        {
             bridge = item.bridge,
             isDefault = item.isDefault,
             isInteractable = item.interactable,
@@ -671,23 +788,30 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     }
 
     // Descends tree to find which child subtree contains the isDefault element.
-    private int FindDefaultChildIndex(int groupIdx) {
+    private int FindDefaultChildIndex(int groupIdx)
+    {
         int cur = _nodes[groupIdx].firstChild;
-        for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling) {
-            if (SubtreeContainsDefault(cur)) {
+        for (int i = 0; cur >= 0; i++, cur = _nodes[cur].nextSibling)
+        {
+            if (SubtreeContainsDefault(cur))
+            {
                 return i;
             }
         }
         return 0;
     }
 
-    private bool SubtreeContainsDefault(int nodeIdx) {
+    private bool SubtreeContainsDefault(int nodeIdx)
+    {
         var node = _nodes[nodeIdx];
-        if (node.IsLeaf) {
+        if (node.IsLeaf)
+        {
             return node.isDefault && node.isInteractable;
         }
-        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling) {
-            if (SubtreeContainsDefault(cur)) {
+        for (int cur = node.firstChild; cur >= 0; cur = _nodes[cur].nextSibling)
+        {
+            if (SubtreeContainsDefault(cur))
+            {
                 return true;
             }
         }
@@ -696,15 +820,18 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // Walks up the VisualElement parent chain to find the direct child of container that
     // contains descendant, or null if descendant is not under container.
-    private static VisualElement? FindDirectChildOf(VisualElement container, VisualElement descendant) {
+    private static VisualElement? FindDirectChildOf(VisualElement container, VisualElement descendant)
+    {
         var current = descendant;
-        while (current != null && current.parent != container) {
+        while (current != null && current.parent != container)
+        {
             current = current.parent;
         }
         return current;
     }
 
-    private static Direction GetFlexAxis(VisualElement container) {
+    private static Direction GetFlexAxis(VisualElement container)
+    {
         var fd = container.resolvedStyle.flexDirection;
         return (fd == FlexDirection.Row || fd == FlexDirection.RowReverse)
             ? Direction.Horizontal
@@ -713,38 +840,48 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // --- Input handlers ---
 
-    private void OnNavigate(Vector2 vec) {
-        if (!IsTop) {
+    private void OnNavigate(Vector2 vec)
+    {
+        if (!IsTop)
+        {
             return;
         }
-        if (graphDirty) {
+        if (graphDirty)
+        {
             RebuildGraph();
         }
 
         var input = VecToDirection(vec);
         var now = Time.realtimeSinceStartup;
 
-        if (input != _lastNavDir) {
+        if (input != _lastNavDir)
+        {
             // Direction changed (including neutral → direction): fire immediately.
             _lastNavDir = input;
             _navHoldStart = now;
             _lastNavTime = now;
-        } else if (input != null) {
+        }
+        else if (input != null)
+        {
             // Same direction held: wait for initial delay, then fire at repeat rate.
-            if (now - _navHoldStart < NavInitialDelay) {
+            if (now - _navHoldStart < NavInitialDelay)
+            {
                 return;
             }
-            if (now - _lastNavTime < NavRepeatRate) {
+            if (now - _lastNavTime < NavRepeatRate)
+            {
                 return;
             }
             _lastNavTime = now;
         }
 
-        if (input == null) {
+        if (input == null)
+        {
             return;
         }
 
-        if (focusedBridge == null) {
+        if (focusedBridge == null)
+        {
             FocusDefault();
             return;
         }
@@ -753,7 +890,8 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         // Walk the navigation tree: bubble up until we find an ancestor group on the pressed axis
         // that has a sibling in the pressed direction, then descend into it.
-        if (_navRootIndex < 0 || !_leafLookup.TryGetValue(focusedBridge, out var curIdx)) {
+        if (_navRootIndex < 0 || !_leafLookup.TryGetValue(focusedBridge, out var curIdx))
+        {
             return;
         }
 
@@ -761,17 +899,22 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
         // Formula: (H axis == positive) maps (H,Right→+1) and (V,Down→+1), (H,Left→-1) and (V,Up→-1).
         int delta = (axis == Direction.Horizontal) == positive ? 1 : -1;
 
-        while (true) {
+        while (true)
+        {
             var cur = _nodes[curIdx];
-            if (cur.parentIndex < 0) {
+            if (cur.parentIndex < 0)
+            {
                 break;
             }
             var group = _nodes[cur.parentIndex];
-            if (group.axis == axis) {
+            if (group.axis == axis)
+            {
                 int targetChildIdx = cur.childIndex + delta;
-                if (targetChildIdx >= 0) {
+                if (targetChildIdx >= 0)
+                {
                     int targetNodeIdx = ChildAt(cur.parentIndex, targetChildIdx);
-                    if (targetNodeIdx >= 0) {
+                    if (targetNodeIdx >= 0)
+                    {
                         var target = ResolveEntry(targetNodeIdx, axis, forward: delta > 0, hint: _previousBridge);
                         NavigateTo(target);
                         return;
@@ -786,36 +929,52 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     // Reset rate-limit state on release so a quick re-press always fires immediately.
     // Without this, a second tap within NavInitialDelay (0.4s) would be treated as a held
     // direction and silently dropped by the repeat-rate check.
-    private void OnNavigateCanceled() {
+    private void OnNavigateCanceled()
+    {
         _lastNavDir = null;
     }
 
-    private void OnSubmit() {
-        if (!IsTop || focusedBridge == null) {
+    private void OnSubmit()
+    {
+        if (!IsTop || focusedBridge == null)
+        {
             return;
         }
         int idx = items.FindIndex(i => i.bridge == focusedBridge);
-        if (idx >= 0 && items[idx].interactable) {
+        if (idx >= 0 && items[idx].interactable)
+        {
             focusedBridge.GetNavigable()?.action.Invoke();
         }
     }
 
-    private void OnSubmitEnded() {
-        if (!IsTop || focusedBridge == null) {
+    private void OnSubmitEnded()
+    {
+        if (!IsTop || focusedBridge == null)
+        {
             return;
         }
         int idx = items.FindIndex(i => i.bridge == focusedBridge);
-        if (idx >= 0 && items[idx].interactable) {
+        if (idx >= 0 && items[idx].interactable)
+        {
             focusedBridge.GetNavigable()?.holdEndAction?.Invoke();
         }
     }
 
-    private void OnCancel() {
-        if (!IsTop) {
+    private void OnCancel()
+    {
+        if (!IsTop)
+        {
             return;
         }
-        foreach (var item in items) {
-            if (item.isBackButton) {
+        if (Props.onCancel != null)
+        {
+            Props.onCancel();
+            return;
+        }
+        foreach (var item in items)
+        {
+            if (item.isBackButton)
+            {
                 item.bridge.GetNavigable()?.action.Invoke();
                 return;
             }
@@ -824,11 +983,14 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
     // Returns (axis, positive) where positive=true means Right or Up (Input System +X / +Y).
     // UIToolkit Y increases downward, so positive Vertical (Up input) means smaller target Y.
-    private static (Direction axis, bool positive)? VecToDirection(Vector2 vec) {
-        if (vec.magnitude < 0.5f) {
+    private static (Direction axis, bool positive)? VecToDirection(Vector2 vec)
+    {
+        if (vec.magnitude < 0.5f)
+        {
             return null;
         }
-        if (Mathf.Abs(vec.x) > Mathf.Abs(vec.y)) {
+        if (Mathf.Abs(vec.x) > Mathf.Abs(vec.y))
+        {
             return (Direction.Horizontal, vec.x > 0f);
         }
         return (Direction.Vertical, vec.y > 0f);
