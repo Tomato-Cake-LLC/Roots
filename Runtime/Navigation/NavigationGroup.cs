@@ -291,6 +291,9 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             isDefault = nav.isDefault,
             isBackButton = nav.isBackButton,
         });
+        // Hovering selects, so the mouse and the gamepad drive one shared highlight rather than
+        // :hover and :focus disagreeing about which button is current.
+        bridge.Element?.RegisterCallback<PointerEnterEvent>(OnNavigablePointerEnter);
         graphDirty = true;
         // PushAndFocus fires before elements register. Focus the first eligible element on late
         // registration. If an isDefault item registers after a non-default was already focused,
@@ -330,8 +333,30 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
             SetBridgeFocus(bridge, false);
             focusedBridge = null;
         }
+        bridge.Element?.UnregisterCallback<PointerEnterEvent>(OnNavigablePointerEnter);
         items.RemoveAt(idx);
         graphDirty = true;
+    }
+
+    // PointerEnterEvent reaches ancestors too, so this fires for a hover anywhere inside the item
+    // (a MenuButton carries its Navigable on the wrapper, above the label that is actually hit).
+    private void OnNavigablePointerEnter(PointerEnterEvent evt)
+    {
+        if (!IsTop || evt.currentTarget is not VisualElement element)
+        {
+            return;
+        }
+        int idx = items.FindIndex(i => i.bridge.Element == element);
+        if (idx < 0 || !items[idx].interactable)
+        {
+            return;
+        }
+        var bridge = items[idx].bridge;
+        if (bridge == focusedBridge)
+        {
+            return;
+        }
+        NavigateTo(bridge);
     }
 
     void INavigationRegistrar.UpdateNavigable(IBridge bridge, Navigable nav)
