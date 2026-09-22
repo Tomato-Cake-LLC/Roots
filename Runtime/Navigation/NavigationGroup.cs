@@ -913,6 +913,15 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
 
         var (axis, positive) = input.Value;
 
+        // Give the focused control first refusal on the direction, so a slider can take Left/Right
+        // rather than the press hopping to the next control.
+        var nav = focusedBridge.GetNavigable();
+        if (nav.HasValue && nav.Value.interactable && nav.Value.onAxis != null
+            && nav.Value.onAxis(AxisStep(axis, positive)))
+        {
+            return;
+        }
+
         // Walk the navigation tree: bubble up until we find an ancestor group on the pressed axis
         // that has a sibling in the pressed direction, then descend into it.
         if (_navRootIndex < 0 || !_leafLookup.TryGetValue(focusedBridge, out var curIdx))
@@ -957,6 +966,19 @@ public partial class NavigationGroup : RishElement<NavigationGroupProps>,
     private void OnNavigateCanceled()
     {
         _lastNavDir = null;
+        if (IsTop && focusedBridge != null)
+        {
+            focusedBridge.GetNavigable()?.onAxisEnd?.Invoke();
+        }
+    }
+
+    // Input-space direction for Navigable.onAxis: +X is Right, +Y is Up. See VecToDirection — this
+    // is the input convention, not UIToolkit's downward Y.
+    private static Vector2 AxisStep(Direction axis, bool positive)
+    {
+        return axis == Direction.Horizontal
+            ? new Vector2(positive ? 1f : -1f, 0f)
+            : new Vector2(0f, positive ? 1f : -1f);
     }
 
     private void OnSubmit()
